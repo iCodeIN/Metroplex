@@ -1,0 +1,16 @@
+{
+   "model_path":"gs://aran-test/models/",
+   "dataset":{
+      "train_path":"gs://aran-test/imagenet32/train/*.tfrecords",
+      "eval_path":"gs://aran-test/imagenet32/valid/*.tfrecords",
+      "image_size":32,
+      "tfrecords":true
+   },
+   "width":512,
+   "transformer":true,
+   "depth":12,
+   "attn_block_opt": 0,
+   "enc_dec_mode": false,
+   "train_batch_size":64,
+   "eval_dataset_size":50000
+}

@@ -1,6 +1,10 @@
 # Metroplex 
 
-<img src="./figs/metroplex.png" width="500"><img src="./figs/variational_attention.png" width="350">
+<p align="center">
+  <img alt="Metroplex" src="./figs/metroplex.png" width="50%">
+&nbsp; &nbsp; &nbsp; &nbsp;
+  <img alt="Variational Attention" src="./figs/variational_attention.png" width="40%">
+</p>
 
 More efficient non-autoregressive image modeling inspired by VD-VAE and ViT
 

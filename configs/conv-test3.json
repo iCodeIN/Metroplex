@@ -9,12 +9,11 @@
    "width":512,
    "transformer":true,
    "depth":12,
-   "train_batch_size":64,
+   "train_batch_size":256,
    "prog_mode":false,
    "lr": 0.001,
    "rezero": true,
-   "enc_dec_mode": true,
    "warmup_steps": 0,
-   "cnn_enc": false,
+   "grad_checkpoint": true,
    "eval_dataset_size":50000
 }

@@ -1,5 +1,7 @@
 # Metroplex 
 
+![Metroplex](./figs/metroplex.png) ![Variational Attention](./figs/variational_attention.png)
+
 More efficient non-autoregressive image modeling inspired by VD-VAE and ViT
 
 - VQ-VAE-based image modeling is currently very popular (e.g. DALL-E). However, it is both computationally inefficient due to the use of discrete bottleneck and extremely slow at sampling due to its autoregressive sampling of discrete latents, the latter of which is especially problematic for audio and video. 
@@ -8,7 +10,7 @@ More efficient non-autoregressive image modeling inspired by VD-VAE and ViT
 
 - Metroplex combines continuous VAE and ViT-style compression together. This allows to project the image into smaller resolution to process it more efficiently and decompresses at the final linear layer. Stable end-to-end training without discrete bottleneck is possible thanks to the use of VD-VAE.
 
-This is a research repo to run experiments to show that Metroplex outperforms VD-VAE and to perform architecture optimization and scaling analysis. It is probably hard for other people to use at the current state. Once the experiments are done, a more simplified repository will be set up to ease the modification and further extension.
+This is a research repo to run experiments to show that Metroplex outperforms VD-VAE and to perform architecture optimization and scaling analysis. It is probably hard for other people to use at the current state. Once the experiments are done, more simplified repositories (TF & PyTorch) will be set up to ease any modification or further extension. For more details about Metroplex, please refer to [this paper](https://www.overleaf.com/read/qjrfdgtghsph) (wip).  
 
 We have borrowed the data pipeline from [DALLE-mtf](https://github.com/EleutherAI/DALLE-mtf), which was developed by [Sid Black](https://github.com/sdtblck), [Ben Wang](https://github.com/kingoflolz) and a few others. 
 
@@ -59,8 +61,8 @@ tensorboard --logdir your_model_dir
 
 - [x] Test Metroplex
 - [x] Add experiments
-- [ ] Finish `run_experiment.py`
-- [ ] Add Imagenet-21k for experiments
+- [x] Finish `run_experiment.py`
+- [x] Add Imagenet-21k for experiments
 - [ ] Finish all the experiments
 - [ ] Enable decoding (pretty much done, but low-priority as ELBO is a robust indicator of quality as in LM)
 - [ ] Build a simple repo streamlined for extension of Metroplex with clear documentation

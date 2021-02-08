@@ -3,7 +3,7 @@ import tensorflow.compat.v2 as tf2
 from tensorflow.compat.v1 import nn
 from functools import partial
 from .helpers import get_1x1, get_3x3, DmolNet, draw_gaussian_diag_samples, \
-gaussian_analytical_kl, layernorm, Attention, AttentionBlock, AttentionBlock2, FFN, CNN
+gaussian_analytical_kl, layernorm, Attention, AttentionBlock, AttentionBlock2, FFN, CNN, recompute_grad
 from collections import defaultdict
 import numpy as np
 import itertools
@@ -82,12 +82,10 @@ class Block:
     
     def forward(self, x):
         xhat = x
-        print(x.shape)
         for idx, conv in enumerate(self.cs):
             with tf.variable_scope("layer_" + str(idx)):
                 xhat = conv(tf2.nn.gelu(xhat))
         out = x + xhat if self.residual else xhat
-        print(xhat.shape)
         if self.down_rate is not None:
             out = self.down_sample(out)
         return out
@@ -126,15 +124,11 @@ def get_width_settings(width, s):
             mapping[int(k)] = int(v)
     return mapping
 
-
-def apply_and_checkpoint(f, params, **kwargs):
+def apply_and_checkpoint(f, params, *args):
     if params.grad_checkpoint:
-        @recompute_grad
-        def inner(x, params):
-            return f(**kwargs)
-        return inner(**kwargs)
+        return recompute_grad(f, params.use_bf16)(*args)
     else:
-        return f(**kwargs)
+        return f(*args)
 
 class Encoder:
     def __init__(self, H):
@@ -170,8 +164,7 @@ class Encoder:
             activations[int(x.shape[2])] = x
         for idx, block in enumerate(self.enc_blocks):
             with tf.variable_scope("block_" + str(idx)):
-                #x = apply_and_checkpoint(block.forward, self.H, (x,))
-                x = block.forward(x)
+                x = apply_and_checkpoint(block.forward, self.H, x)
             res = int(x.shape[2])
             x = x if x.shape[1] == self.widths[res] else pad_channels(x, self.widths[res])
             if self.H.transformer:
@@ -233,21 +226,10 @@ class DecBlock:
             z = draw_gaussian_diag_samples(pm, pv)
         return z, xpp
 
-    def get_inputs(self, xs, activations):
-        acts = activations[self.base]
-        if self.base in xs:
-            x = xs[self.base]
-        else:
-            x = tf.zeros_like(acts)
-        x_shape = x.shape.as_list()
-        x_shape[0] = tf.shape(acts)[0]
-        x = tf.broadcast_to(x, x_shape)
-        return x, acts
-
-    def _forward(self, x, xs=None, acts=None, t=None, lvs=None, cond=False):
+    def _forward(self, x, x_prev=None, acts=None, t=None, lvs=None, cond=False):
         if self.mixin is not None:
             with tf.variable_scope("upsample"):
-                x += self.upsample(xs[self.mixin][:, :x.shape[1], ...])
+                x += self.upsample(x_prev[:, :x.shape[1], ...])
         with tf.variable_scope("presample"):        
             x = self.pre_sample.forward(x)
         
@@ -261,18 +243,13 @@ class DecBlock:
         x = self.z_fn(z) + xpp + res
         with tf.variable_scope("resnet"):
             x = self.resnet.forward(x)
-        if self.H.transformer:
-            xs = x
-        else:
-            xs[self.base] = x
         if cond:
-            return xs, dict(kl=kl)
+            return x, kl
         else:
-            return xs
+            return x
 
-    def forward(self, xs, activations):
-        x, acts = self.get_inputs(xs, activations)
-        return self._forward(x, xs, acts=acts, cond=True)
+    def forward(self, x, x_prev, activation):
+        return self._forward(x, x_prev, acts=activation, cond=True) #
 
     def forward_uncond(self, xs, t=None, lvs=None):
         if self.base in xs:
@@ -304,10 +281,8 @@ class AttnDecBlock(DecBlock):
                           name='dec-prior_'+str(self.idx))
         self.resnet = FFN(H, width, init_scale=self.n_blocks)
 
-    def get_inputs(self, xs, activations):
-        idx = self.idx if self.H.enc_dec_mode else self.n_blocks - self.idx - 1
-        acts = activations[idx]
-        return xs, acts
+    def forward(self, x, activation):
+        return self._forward(x, acts=activation, cond=True)
     
     def _enc(self, x, acts, res=None):
         out, _ = self.enc.forward(x, acts, res=res)
@@ -339,6 +314,7 @@ class Decoder:
         dec_blocks = []
         self.widths = get_width_settings(H.outer_width, H.custom_width_str)
         blocks = parse_layer_string(H.dec_blocks)
+        self.res_idx, self.mixin_idx = {}, {}
         for idx, (res, mixin) in enumerate(blocks):
             if H.transformer:
                 block = AttnDecBlock(H, res, mixin, n_blocks=len(blocks), idx=idx)
@@ -346,12 +322,15 @@ class Decoder:
                 block = DecBlock(H, res, mixin, n_blocks=len(blocks))
             dec_blocks.append(block)
             resos.add(res)
+            self.res_idx[idx] = res
+            self.mixin_idx[idx] = mixin
+            self.n_blocks = len(blocks)
         self.resolutions = sorted(resos)
         self.dec_blocks = dec_blocks
         zeros = tf.initializers.zeros(dtype=H.dtype)
         ones = tf.initializers.ones(dtype=H.dtype)
         if H.transformer:
-            if self.H.abs_enc:
+            if self.H.abs_enc == 'start':
                 self.abs_enc = positional_embedding(H)
             res = H.base_hidden_res
             name = 'bias_xs_' + str(res) 
@@ -366,7 +345,7 @@ class Decoder:
                                           initializer=zeros, trainable=True, dtype=H.dtype)]
         self.out_net = DmolNet(H)
         self.outer_res = res
-        if H.final_fn:
+        if H.final_fn and H.exp_scale == 1:
             self.gain = tf.get_variable('gain', shape=(1, self.widths[res], 1, 1), initializer=ones, trainable=True, dtype=H.dtype)
             self.bias = tf.get_variable('bias', shape=(1, self.widths[res], 1, 1), initializer=zeros, trainable=True, dtype=H.dtype)
             self.final_fn = lambda x: x * self.gain + self.bias
@@ -378,15 +357,29 @@ class Decoder:
         if self.H.transformer:
             n = tf.shape(activations[0])[0]
             xs = tf.tile(self.bias_xs, multiples = [n, 1, 1, 1]) 
-            if self.H.abs_enc:
+            if self.H.abs_enc == 'start':
                 xs += self.abs_enc(xs, tf.shape(xs)[0])
         else: 
-            xs = {int(a.shape[2]): a for a in self.bias_xs} 
+            n = tf.shape(activations[self.res_idx[0]])[0]
+            xs = {int(a.shape[2]): tf.tile(a, multiples = [n, 1, 1, 1]) for a in self.bias_xs} 
         for idx, block in enumerate(self.dec_blocks):
             with tf.variable_scope("block_" + str(idx)):
-                #xs, block_stats = apply_and_checkpoint(block.forward, self.H, (xs, activations))
-                xs, block_stats = block.forward(xs, activations)
-            stats.append(block_stats)
+                if self.H.transformer:
+                    act_idx = idx if self.H.enc_dec_mode else self.n_blocks - idx - 1
+                    act = activations[act_idx]
+                    xs, block_stats = apply_and_checkpoint(block.forward, self.H, xs, act)
+                else:
+                    res = self.res_idx[idx]
+                    act = activations[res]
+                    if res in xs:
+                        x = xs[res]
+                    else:
+                        x = tf.zeros_like(act)
+                    mixin = self.mixin_idx[idx]
+                    x_prev = xs[mixin] if mixin else x
+                    x, block_stats = apply_and_checkpoint(block.forward, self.H, x, x_prev, act)
+                    xs[res] = x 
+                stats.append(block_stats)
         x = xs if self.H.transformer else xs[self.outer_res]
         with tf.variable_scope("final_fn"):        
             x = self.final_fn(x)
@@ -423,14 +416,14 @@ class Metroplex:
             activations = self.encoder.forward(x)
         with tf.variable_scope("decoder"):        
             px_z, stats = self.decoder.forward(activations)
-            distortion_per_pixel, images = self.decoder.out_net.nll(px_z, x_target)
+            distortion_per_pixel = self.decoder.out_net.nll(px_z, x_target)
         rate_per_pixel = tf.zeros_like(distortion_per_pixel)
         ndims = tf.cast(tf.math.reduce_prod(x.shape[1:]), dtype=x.dtype)
         for statdict in stats:
-            rate_per_pixel += tf.reduce_sum(statdict['kl'], axis=(1, 2, 3))
+            rate_per_pixel += tf.reduce_sum(statdict, axis=(1, 2, 3))
         rate_per_pixel /= ndims
         elbo = tf.reduce_mean(distortion_per_pixel + rate_per_pixel)
-        return dict(elbo=elbo, distortion=tf.reduce_mean(distortion_per_pixel), rate=tf.reduce_mean(rate_per_pixel)), images
+        return dict(elbo=elbo, distortion=tf.reduce_mean(distortion_per_pixel), rate=tf.reduce_mean(rate_per_pixel))
 
     def forward_uncond_samples(self, n_batch, t=None):
         with tf.variable_scope("decoder"):

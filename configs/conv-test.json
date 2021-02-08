@@ -7,10 +7,11 @@
       "tfrecords":true
    },
    "width":1024,
+   "steps_per_checkpoint": 2000, 
    "transformer":false,
    "depth":12,
    "train_batch_size":64,
-   "prog_mode":1,
-   "start_res":32,
+   "prog_mode":false,
+   "grad_checkpoint": true,
    "eval_dataset_size":50000
 }

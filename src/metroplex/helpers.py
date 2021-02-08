@@ -5,6 +5,49 @@ from functools import partial
 import numpy as np
 from einops import rearrange, repeat
 
+
+def recompute_grad(f, bf16=False):
+    @tf.custom_gradient
+    def inner(*args, **kwargs):
+        result = f(*args, **kwargs)
+        if isinstance(result, list) or isinstance(result, tuple):
+            result = [tf.stop_gradient(v) for v in result]
+        else:
+            result = tf.stop_gradient(result)
+        scope = tf.get_default_graph().get_name_scope()
+
+        def grad(*dresult, variables=None):
+            dresult = [dresult] if not (isinstance(dresult, list) or isinstance(dresult, tuple)) else dresult
+            with tf.GradientTape() as t:
+                t.watch(args)
+                if variables is not None:
+                    t.watch(variables)
+                # we need to outsmart XLA here to force a control dependency
+                zero_with_control_dependency = tf.math.add_n([tf.reduce_mean(v[0] * 1e-30) for v in dresult])
+                new_args = []
+                for a in args:
+                    if a.dtype.is_floating:
+                        new_args.append(a + tf.cast(zero_with_control_dependency, a.dtype))
+                    else:
+                        new_args.append(a)
+
+                with tf.control_dependencies(dresult):
+                    if bf16:
+                        with tf.tpu.bfloat16_scope():
+                            with tf.variable_scope(scope, reuse=True):
+                                result = f(*new_args, **kwargs)
+                    else:
+                        with tf.variable_scope(scope, reuse=True):
+                            result = f(*new_args, **kwargs)
+            kw_vars = []
+            if variables is not None:
+                kw_vars = list(variables)
+            grads = t.gradient(result, list(new_args) + kw_vars, output_gradients=dresult)
+            return grads[:len(new_args)], grads[len(new_args):]
+
+        return result, grad
+    return inner
+
 def gaussian_analytical_kl(mu1, mu2, logsigma1, logsigma2):
     return -0.5 + logsigma2 - logsigma1 + 0.5 * (tf.math.exp(logsigma1) ** 2 + (mu1 - mu2) ** 2) / (tf.math.exp(logsigma2) ** 2)
 
@@ -86,9 +129,10 @@ class DmolNet:
     def build(self):
         out_dim = self.H.num_mixtures * self.num_params_per_mixture * (self.H.exp_scale ** 2)
         self.out_conv = get_conv(self.H, out_dim, kernel_size=1, name='out_conv')
-        # TODO!!!!!!!! check how to make this stable
-        if self.H.shared_sigma:
-            self.shared_sigma = tf.get_variable('sigma', shape=(1,), initializer='ones', dtype=H.dtype, trainable=True)
+        stddev = 0.02 
+        initializer = tf.random_uniform_initializer(minval=-stddev, maxval=stddev, dtype=self.H.dtype)
+        if self.H.shared_sigma == 'full':
+            self.shared_sigma = tf.get_variable('dmol_sigma', shape=(1,), initializer=initializer, dtype=self.H.dtype, trainable=True)
 
     def nll(self, px_z, x):
         return self.discretized_mix_logistic_loss(x=x, l=self.forward(px_z))
@@ -118,15 +162,20 @@ class DmolNet:
             logit_probs = l[:, :, :, :nr_mix]
         l = tf.reshape(l[:, :, :, nr_mix:], xs + [nr_mix * 3])
         means = l[:, :, :, :, :nr_mix]
-        log_scales = const_max(l[:, :, :, :, nr_mix:2 * nr_mix], -7.)
-        if self.H.shared_sigma:
-            log_scales = const_max(tf.fill(tf.shape(l[:, :, :, :, nr_mix:2 * nr_mix]), self.shared_sigma), -7.)            
-        coeffs = tf.tanh(l[:, :, :, :, 2 * nr_mix:3 * nr_mix])
-        if self.H.color_non_ar:
-            coeffs = tf.zeros_like(coeffs)
+        if self.H.shared_sigma == 'full':
+            log_scales = const_max(tf.broadcast_to(self.shared_sigma, tf.shape(l[:, :, :, :, nr_mix:2 * nr_mix])), -7.)            
+        elif self.H.shared_sigma == 'mixtures':
+            log_scales = const_max(tf.broadcast_to(l[:, :, :, :, nr_mix:nr_mix+1], tf.shape(l[:, :, :, :, nr_mix:2 * nr_mix])), -7.)            
+        else:
+            log_scales = const_max(l[:, :, :, :, nr_mix:2 * nr_mix], -7.)
         x = tf.reshape(x, xs + [1]) + tf.zeros(xs + [nr_mix], dtype=x.dtype)  # here and below: getting the means and adjusting them based on preceding sub-pixels
-        m2 = tf.reshape(means[:, :, :, 1, :] + coeffs[:, :, :, 0, :] * x[:, :, :, 0, :], [xs[0], xs[1], xs[2], 1, nr_mix])
-        m3 = tf.reshape(means[:, :, :, 2, :] + coeffs[:, :, :, 1, :] * x[:, :, :, 0, :] + coeffs[:, :, :, 2, :] * x[:, :, :, 1, :], [xs[0], xs[1], xs[2], 1, nr_mix])
+        if self.H.color_non_ar:
+            m2 = tf.reshape(means[:, :, :, 1, :], [xs[0], xs[1], xs[2], 1, nr_mix])
+            m3 = tf.reshape(means[:, :, :, 2, :], [xs[0], xs[1], xs[2], 1, nr_mix])
+        else:
+            coeffs = tf.tanh(l[:, :, :, :, 2 * nr_mix:3 * nr_mix])
+            m2 = tf.reshape(means[:, :, :, 1, :] + coeffs[:, :, :, 0, :] * x[:, :, :, 0, :], [xs[0], xs[1], xs[2], 1, nr_mix])
+            m3 = tf.reshape(means[:, :, :, 2, :] + coeffs[:, :, :, 1, :] * x[:, :, :, 0, :] + coeffs[:, :, :, 2, :] * x[:, :, :, 1, :], [xs[0], xs[1], xs[2], 1, nr_mix])
         means = tf.concat([tf.reshape(means[:, :, :, 0, :], [xs[0], xs[1], xs[2], 1, nr_mix]), m2, m3], axis=3)
         
         centered_x = x - means
@@ -162,8 +211,54 @@ class DmolNet:
             log_probs += log_prob_from_logits(logit_probs)
         mixture_probs = tf.reduce_logsumexp(log_probs, axis=-1)
         output = -1. * tf.reduce_sum(mixture_probs, axis=[1, 2]) / np.prod([int(x) for x in xs[1:]])
-        return output, means
+        return output
 
+    def adaptive_discretized_mix_logistic_loss(self, x, l): # incomplete
+        """ log-likelihood for mixture of discretized logistics, assumes the data has been rescaled to [-1,1] interval """
+        # Adapted from https://github.com/openai/pixel-cnn/blob/master/pixel_cnn_pp/nn.py
+        xs = [s for s in x.shape]  # true image (i.e. labels) to regress to, e.g. (B,32,32,3)
+        ls = [s for s in l.shape]  # predicted distribution, e.g. (B,32,32,100)
+        xs[0] = ls[0] = tf.shape(x)[0]
+        nr_mix = self.H.num_mixtures  # here and below: unpacking the params of the mixture of logistics
+        logit_probs = l[:, :, :, :nr_mix]
+        l = tf.reshape(l[:, :, :, nr_mix:], xs + [nr_mix * 3])
+        means = l[:, :, :, :, :nr_mix]
+        log_scales = const_max(l[:, :, :, :, nr_mix:2 * nr_mix], -7.)
+        x = tf.reshape(x, xs + [1]) + tf.zeros(xs + [nr_mix], dtype=x.dtype)  # here and below: getting the means and adjusting them based on preceding sub-pixels
+        
+        centered_x = x - means
+        inv_stdv = tf.exp(-log_scales)
+        plus_in = inv_stdv * (centered_x + 1. / 255.)
+        cdf_plus = tf.sigmoid(plus_in)
+        min_in = inv_stdv * (centered_x - 1. / 255.)
+        cdf_min = tf.sigmoid(min_in)
+        log_cdf_plus = plus_in - tf.math.softplus(plus_in)  # log probability for edge case of 0 (before scaling)
+        log_one_minus_cdf_min = -tf.math.softplus(min_in)  # log probability for edge case of 255 (before scaling)
+        cdf_delta = cdf_plus - cdf_min  # probability for all other cases
+        mid_in = inv_stdv * centered_x
+        log_pdf_mid = mid_in - log_scales - 2. * tf.math.softplus(mid_in)  # log probability in the center of the bin, to be used in extreme cases (not actually used in our code)
+
+        # now select the right output: left edge case, right edge case, normal case, extremely low prob case (doesn't actually happen for us)
+
+        # this is what we are really doing, but using the robust version below for extreme cases in other applications and to avoid NaN issue with tf.select()
+        # log_probs = tf.select(x < -0.999, log_cdf_plus, tf.select(x > 0.999, log_one_minus_cdf_min, tf.math.log(cdf_delta)))
+
+        # robust version, that still works if probabilities are below 1e-5 (which never happens in our code)
+        # tensorflow backpropagates through tf.select() by multiplying with zero instead of selecting: this requires use to use some ugly tricks to avoid potential NaNs
+        # the 1e-12 in tf.maximum(cdf_delta, 1e-12) is never actually used as output, it's purely there to get around the tf.select() gradient issue
+        # if the probability on a sub-pixel is below 1e-5, we use an approximation based on the assumption that the log-density is constant in the bin of the observed sub-pixel value
+        log_probs = tf.where(x < -0.999,
+                                log_cdf_plus,
+                                tf.where(x > 0.999,
+                                            log_one_minus_cdf_min,
+                                            tf.where(cdf_delta > 1e-5,
+                                                        tf.math.log(const_max(cdf_delta, 1e-12)),
+                                                        log_pdf_mid - np.log(127.5))))
+        log_probs = tf.reduce_sum(log_probs, axis=3)
+        log_probs += log_prob_from_logits(logit_probs)
+        mixture_probs = tf.reduce_logsumexp(log_probs, axis=-1)
+        output = -1. * tf.reduce_sum(mixture_probs, axis=[1, 2]) / np.prod([int(x) for x in xs[1:]])
+        return output
 
     def sample_from_discretized_mix_logistic(self, l):
         ls = [s for s in l.shape.as_list()]
@@ -360,7 +455,7 @@ class Attention:
         self.qkv = get_1x1(H, qkv_dim, name='qkv')
         out_dim = output_dim if output_dim else dim 
         self.out = get_1x1(H, out_dim, name='out')
-        length = self.attn_scale
+        self.length = length = self.attn_scale
         self.num_heads = dim // H.head_dim
         self.postprocess = postprocess(H, dim)
         def init(shape, dtype):
@@ -369,18 +464,23 @@ class Attention:
             x[length:] = x[length-2::-1]
             x = repeat(x, 'length -> num_heads length', num_heads = self.num_heads)
             return tf.constant(x, dtype=H.dtype)
+        stddev = np.sqrt(1 / dim) 
+        initializer = init if not H.random_init_posenc else tf.random_uniform_initializer(minval=-stddev, maxval=stddev, dtype=H.dtype)
+        
         def f(idx):
-            x = tf.get_variable(name + "-rel_bias"+str(idx), [self.num_heads, 2*length-1], initializer=init, dtype=H.dtype)
-            x = repeat(x, 'n k -> n q k', q = length)
+            return tf.get_variable(name + "-rel_bias"+str(idx), [self.num_heads, 2*length-1], initializer=initializer, dtype=H.dtype)
+        self.rel_bias = tuple(map(f, (1, 2)))
+
+    def make_rel_bias(self):
+        def f(x):
+            x = repeat(x, 'n k -> n q k', q = self.length)
             x_size = tf.shape(x)
             x = tf.pad(x, [[0, 0], [0, 0], [1, 0]])
             x = tf.reshape(x, [x_size[0], x_size[2] + 1, x_size[1]])
             x = tf.slice(x, [0, 1, 0], [-1, -1, -1])
-            x = tf.reshape(x, x_size)[..., :length]
-            return x
-
-        x1, x2 = map(f, (1, 2))
-        self.rel_bias = tf.einsum('nab, ncd -> nacbd', x1, x2)
+            return tf.reshape(x, x_size)[..., :self.length]
+        x1, x2 = map(f, self.rel_bias)
+        return tf.einsum('nab, ncd -> nacbd', x1, x2)
 
     def forward(self, inp, ctx=None):
         attn_scale = self.attn_scale
@@ -392,7 +492,7 @@ class Attention:
         q, k, v = map(lambda x: rearrange(x, 'b (num_heads head_dim) h w -> b num_heads (h w) head_dim', num_heads=self.num_heads), (q, k, v)) 
         qk = tf.einsum('bnqd, bnkd -> bnqk', q, k) 
         qk = rearrange(qk, 'b num_heads (h1 w1) (h2 w2) -> b num_heads h1 w1 h2 w2', h1=attn_scale, h2=attn_scale)
-        bias = tf.tile(self.rel_bias[None], multiples = [tf.shape(qk)[0], 1, 1, 1, 1, 1])
+        bias = tf.tile(self.make_rel_bias()[None], multiples = [tf.shape(qk)[0], 1, 1, 1, 1, 1])
         norm_q = repeat(tf.norm(tf.stop_gradient(q), axis=-1), 'b num_heads (h1 w1) -> b num_heads h1 w1 h2 w2', h1=attn_scale, h2=attn_scale, w2=attn_scale)
         qk += norm_q * bias
         qk = rearrange(qk, 'b num_heads h1 w1 h2 w2 -> b num_heads (h1 w1) (h2 w2)')
@@ -427,11 +527,12 @@ class AttentionBlock2:
 
     def build(self):
         H, dim, cur_res, output_dim, cross, zero_weights, name, enc = self.param_list
-        use_cnn = enc and H.cnn_enc
-        if use_cnn:
-            self.attention = CNN(H, dim, cur_res, cross=cross, name=name)
-        else:
+        if (not enc) or H.enc_mode == 'attn':
             self.attention = Attention(H, dim, cur_res, cross=cross, name=name)
+        elif H.enc_mode == 'cnn':
+            self.attention = CNN(H, dim, cur_res, cross=True, name=name)
+        elif H.enc_mode == 'ffn':
+            self.attention = FFN(H, dim, cross=True)
         self.layernorm = layernorm
         self.linear = get_1x1(H, output_dim, zero_weights=zero_weights, name='proj_z')
 
@@ -441,11 +542,12 @@ class AttentionBlock2:
         return out, x
 
 class FFN:
-    def __init__(self, H, width, down_rate=None, init_scale=None):
+    def __init__(self, H, width, down_rate=None, init_scale=None, cross=False):
         self.H = H
         self.width = width
         self.init_scale = init_scale
         self.down_rate = down_rate
+        self.cross = cross
         self.build()
     
     def build(self):
@@ -456,7 +558,9 @@ class FFN:
         self.layernorm = layernorm
         self.postprocess = postprocess(H, self.width)
 
-    def forward(self, x):
+    def forward(self, x, ctx=None):
+        if self.cross:
+            x = tf.concat([x, ctx], axis=1)
         xhat = x
         xhat = self.layernorm(xhat, axis=1)
         for idx, conv in enumerate(self.cs):
@@ -464,7 +568,8 @@ class FFN:
                 xhat = conv(xhat)
                 if idx == 0:
                     xhat = tf2.nn.gelu(xhat)
-        out = x + self.postprocess(xhat)
-        if self.down_rate is not None:
-            out = self.down_sample(out)
-        return out
+        out = self.postprocess(xhat) 
+        if self.cross: 
+            return out
+        else:
+            return out + x

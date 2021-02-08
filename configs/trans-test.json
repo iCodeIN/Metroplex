@@ -10,7 +10,8 @@
    "transformer":true,
    "depth":12,
    "attn_block_opt": 0,
-   "enc_dec_mode": false,
-   "train_batch_size":64,
+   "enc_dec_mode": true,
+   "train_batch_size":256,
+   "grad_checkpoint": true,
    "eval_dataset_size":50000
 }

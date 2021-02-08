@@ -9,7 +9,9 @@
    "width":1024,
    "transformer":false,
    "depth":12,
-   "train_batch_size":8,
-   "prog_mode":0,
+   "train_batch_size":64,
+   "prog_mode":false,
+   "lr_decay": "none",
+   "eval_steps": 0,
    "eval_dataset_size":50000
 }

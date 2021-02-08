@@ -99,7 +99,7 @@ class Hparams(Hyperparams):
         # fixed
         self.optimizer = "adam"
         self.lr_decay = "cosine"
-        self.warmup_steps = 3000
+        self.warmup_steps = 100
         self.skip_threshold = 300
         self.beta_1 = 0.9
         self.beta_2 = 0.999
@@ -107,10 +107,11 @@ class Hparams(Hyperparams):
         # training misc.---------------------
         # maybe changed
         self.dataset = MANDATORY
-        self.steps_per_checkpoint = 10000 
+        self.steps_per_checkpoint = 1000 
         self.iterations = 500
-        self.grad_checkpoint = False # yet to be implemented
-        self.train_batch_size = 1024 # eval/pred batch_size is made equal to this by default
+        self.iters_per_host_call = 100
+        self.grad_checkpoint = False 
+        self.train_batch_size = 256 # eval/pred batch_size is made equal to this by default
         self.eval_batch_size = OPTIONAL
         self.predict_batch_size = OPTIONAL
         self.train_steps = 40000
@@ -139,7 +140,7 @@ class Hparams(Hyperparams):
         self.outer_width = CONSTRAINED
         self.zdim_factor = 32
         self.zero_weights = True
-        self.final_fn = True
+        self.final_fn = False
         self.model_path = MANDATORY
         self.custom_width_str = CONSTRAINED
         self.enc_blocks = self.dec_blocks = CONSTRAINED
@@ -154,8 +155,8 @@ class Hparams(Hyperparams):
         # DMOL specific-----------------------
         # maybe changed
         self.num_mixtures = 10
-        self.shared_sigma = False
-        self.color_non_ar = False
+        self.shared_sigma = None
+        self.color_non_ar = True
 
         # transformer specific----------------
         # maybe changed
@@ -169,7 +170,7 @@ class Hparams(Hyperparams):
         # 0: self-attn -> (linear, cross-attn) -> FFN
         # 1: (self-attn, cross-attn) -> FFN
 
-        self.enc_dec_mode = False
+        self.enc_dec_mode = True
         # True: enc-dec-like architecture
         # False: UNet-like architecture
 
@@ -178,11 +179,15 @@ class Hparams(Hyperparams):
         self.head_dim = 128 
 
         # tempory params for exps
-        self.rezero = False
+        self.rezero = True
         self.abs_enc = False
-        self.cnn_enc = False
         self.init_std = None
         self.init_scale = None
+        self.enc_mode = 'attn'
+        self.random_init_posenc = False
+
+        #self.save_freq = 10
+        #self.thresholding = True
 
     def check_input(self, input):
         valid_keys = self.keys()
@@ -203,10 +208,10 @@ class Hparams(Hyperparams):
 
         if self.batch_size_inv_factor:
             for mode in ['train', 'eval']:
-                self[mode + '_batch_size'] /= self.batch_size_inv_factor
+                self[mode + '_batch_size'] = int(self[mode + '_batch_size'] / self.batch_size_inv_factor)
 
         if self.iter_factor:
-            self.train_steps *= self.iter_factor 
+            self.train_steps = int(self.train_steps * self.iter_factor) 
             
         if self.eval_steps is None:
             print('eval_steps is not None. Evaluation will be on the whole evaluation'\

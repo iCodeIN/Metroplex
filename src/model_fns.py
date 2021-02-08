@@ -5,16 +5,14 @@ from .optimizers import get_optimizer
 from .metroplex.models import Metroplex
 from .utils import scalar_summary, mode_to_str, create_host_call
 from configs.config import Hyperparams
+from .stabilizer import Stabilizer
 
 def model_fn(features, labels, mode, params):
-    # Build mtf_features & seq length dict for getting number of microbatches
-    # We need to pack inputs into a dict to pass into serialize_training_step
 
     H = W = params["dataset"]["image_size"]  # TODO: check equal
     mode_str = mode_to_str(mode)
     batch_size = params[f"{mode_str}_batch_size"]
     n_channels = params.get("input_channels", 3)
-    model = Metroplex(Hyperparams(params))
 
     if mode == tf.estimator.ModeKeys.PREDICT:
         raise NotImplementedError
@@ -23,23 +21,25 @@ def model_fn(features, labels, mode, params):
     assert (mode == tf.estimator.ModeKeys.TRAIN or mode == tf.estimator.ModeKeys.EVAL)
 
     @tf.autograph.to_graph
-    def inner(model, features):
-        # TODO: add back in microbatching
-        if params.get("use_bf16", False):
-            with tf.tpu.bfloat16_scope():
-                with tf.variable_scope("metroplex"):
-                    stats, reconstruction = model.forward(tf.cast(features, tf.bfloat16))
-        else:
-            with tf.variable_scope("metroplex"): #TODO: fix here too!!
-                stats, reconstruction = model.forward(features)
+    def inner(features):
+        with tf.variable_scope("metroplex"):
+            model = Metroplex(Hyperparams(params))
+            if params.get("use_bf16", False):
+                with tf.tpu.bfloat16_scope():
+                    stats = model.forward(tf.cast(features, tf.bfloat16))
+            else:
+                stats = model.forward(features)
 
-        reconstruction = tf.cast(reconstruction, tf.float32)
         loss = tf.cast(stats['elbo'], tf.float32)
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
         with tf.control_dependencies(update_ops):
             train_op, stats, gs = get_optimizer(stats, params)
-        return stats, reconstruction, loss, train_op, gs
-    stats, reconstruction, loss, train_op, gs = inner(model, features)
+            '''stablizer = Stabilizer(params)
+            if mode == tf.estimator.ModeKeys.TRAIN:
+                with tf.control_dependencies([train_op]):
+                    train_ops, stats = stablizer.apply(stats, gs)'''            
+        return stats, loss, train_op, gs
+    stats, loss, train_op, gs = inner(features)
 
     # To log the loss, current learning rate, and epoch for Tensorboard, the
     # summary op needs to be run on the host CPU via host_call. host_call
